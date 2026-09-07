@@ -1,7 +1,7 @@
 /*
-  MASTER ROBOTIC ARM CODE - DEBUGGED & OPTIMIZED
-  Based on DroneBot Workshop ESP-NOW Demo
-  Controls a robotic arm via ESP-NOW protocol
+  MASTER ROBOTIC ARM CODE - SINGLE VALUE CONTROL
+  Reads ONE potentiometer and transmits ONLY when value changes
+  Error-checked and optimized for accuracy
 */
 
 #include <esp_now.h>
@@ -11,21 +11,16 @@
 // MAC Address of SLAVE - UPDATE WITH YOUR SLAVE'S MAC ADDRESS
 uint8_t broadcastAddress[] = {0x68, 0x09, 0x47, 0x9D, 0xB8, 0x88};
 
-// GPIO Pins for Potentiometers and Button
-#define POT_BASE 34        // Base rotation potentiometer
-#define POT_SHOULDER 35    // Shoulder potentiometer
-#define POT_ELBOW 32       // Elbow potentiometer
-#define GRIPPER_BUTTON 4   // Gripper control button
+// GPIO Pin for single Potentiometer
+#define POT_PIN 34        // Potentiometer analog input
 
-// Update frequency (milliseconds)
-#define UPDATE_RATE 20     // 50Hz update rate
+// Update frequency and sensitivity
+#define UPDATE_RATE 50    // Check potentiometer every 50ms
+#define THRESHOLD 2       // Only send if change > 2 units (reduces noise)
 
 // ========== DATA STRUCTURE ==========
 typedef struct struct_message {
-  int angleBase;       // Base rotation angle (0-180)
-  int angleShoulder;   // Shoulder angle (0-180)
-  int angleElbow;      // Elbow angle (0-180)
-  int gripperState;    // Gripper state (0=Open, 1=Close)
+  int servoAngle;       // Single servo angle value (0-180)
 } struct_message;
 
 struct_message myData;
@@ -35,27 +30,23 @@ esp_now_peer_info_t peerInfo;
 
 // ========== VARIABLES ==========
 unsigned long lastSendTime = 0;
-int failureCount = 0;
-const int MAX_FAILURES = 5;
+unsigned long lastCheckTime = 0;
+int lastSentAngle = -1;  // Store last sent angle to detect changes
+int sendCount = 0;
 
 // ========== CALLBACK FUNCTION ==========
 // Called when data is sent to slave
 void OnDataSent(const uint8_t *mac_addr, esp_now_send_status_t status) {
-  Serial.print("[");
-  Serial.print(millis());
-  Serial.print("] Last Packet Send Status: ");
-  
   if (status == ESP_NOW_SEND_SUCCESS) {
-    Serial.println("✓ Delivery Success");
-    failureCount = 0; // Reset failure counter
+    Serial.print("✓ Packet #");
+    Serial.print(sendCount);
+    Serial.print(" sent successfully | Angle: ");
+    Serial.print(myData.servoAngle);
+    Serial.println("°");
   } else {
-    Serial.println("✗ Delivery Failed");
-    failureCount++;
-    
-    if (failureCount >= MAX_FAILURES) {
-      Serial.println("WARNING: Multiple send failures - check slave connection!");
-      failureCount = 0;
-    }
+    Serial.print("✗ Packet #");
+    Serial.print(sendCount);
+    Serial.println(" - Delivery FAILED!");
   }
 }
 
@@ -67,15 +58,12 @@ void setup() {
   delay(1000);
   
   Serial.println("\n\n========================================");
-  Serial.println("ESP32 ESP-NOW MASTER - ROBOTIC ARM");
+  Serial.println("ESP32 ESP-NOW MASTER - SINGLE VALUE");
   Serial.println("========================================\n");
   
-  // Configure GPIO pins
-  Serial.println("Configuring GPIO pins...");
-  pinMode(POT_BASE, INPUT);
-  pinMode(POT_SHOULDER, INPUT);
-  pinMode(POT_ELBOW, INPUT);
-  pinMode(GRIPPER_BUTTON, INPUT_PULLUP);
+  // Configure GPIO pin
+  Serial.println("Configuring ADC pin...");
+  pinMode(POT_PIN, INPUT);
   
   // Print ESP32 MAC Address
   Serial.print("Master MAC Address: ");
@@ -87,90 +75,75 @@ void setup() {
   Serial.println("\nInitializing Wi-Fi in STA mode...");
   WiFi.mode(WIFI_STA);
   WiFi.setChannel(1);      // Channel must match slave
-  WiFi.setSleep(false);    // Disable Wi-Fi sleep for faster communication
+  WiFi.setSleep(false);    // Disable Wi-Fi sleep
   
   // Initialize ESP-NOW
   Serial.println("Initializing ESP-NOW...");
   if (esp_now_init() != ESP_OK) {
-    Serial.println("✗ Error initializing ESP-NOW");
-    while(1) {
-      Serial.println("FATAL: Rebooting...");
-      delay(1000);
-    }
+    Serial.println("✗ FATAL ERROR: ESP-NOW initialization failed!");
     return;
   }
   
-  Serial.println("✓ ESP-NOW initialized successfully");
+  Serial.println("✓ ESP-NOW initialized");
   
   // Register send callback
   if (esp_now_register_send_cb(OnDataSent) != ESP_OK) {
-    Serial.println("✗ Error registering send callback");
+    Serial.println("✗ ERROR: Could not register send callback");
     return;
   }
   Serial.println("✓ Send callback registered");
   
   // Register peer (slave)
-  Serial.println("\nRegistering peer (slave)...");
+  Serial.println("\nRegistering peer (slave device)...");
   memcpy(peerInfo.peer_addr, broadcastAddress, 6);
-  peerInfo.channel = 1;      // MUST MATCH slave's channel
+  peerInfo.channel = 1;
   peerInfo.encrypt = false;
   
   if (esp_now_add_peer(&peerInfo) != ESP_OK) {
-    Serial.println("✗ Failed to add peer");
+    Serial.println("✗ FATAL ERROR: Failed to add peer!");
     return;
   }
   
   Serial.println("✓ Peer registered successfully");
   Serial.println("\n========================================");
-  Serial.println("MASTER READY - Waiting for input...");
+  Serial.println("MASTER READY - Move potentiometer...");
   Serial.println("========================================\n");
   
-  lastSendTime = millis();
+  lastCheckTime = millis();
 }
 
 // ========== MAIN LOOP ==========
 void loop() {
   
-  // Check if it's time to send data
-  if (millis() - lastSendTime >= UPDATE_RATE) {
-    lastSendTime = millis();
+  // Check potentiometer at defined interval
+  if (millis() - lastCheckTime >= UPDATE_RATE) {
+    lastCheckTime = millis();
     
-    // Read Potentiometer values (0-4095)
-    int valBase = analogRead(POT_BASE);
-    int valShoulder = analogRead(POT_SHOULDER);
-    int valElbow = analogRead(POT_ELBOW);
+    // Read potentiometer value (0-4095)
+    int rawValue = analogRead(POT_PIN);
     
-    // Map potentiometer values to servo angles
-    // Adjust these ranges based on your potentiometer calibration
-    myData.angleBase = map(constrain(valBase, 0, 4095), 0, 4095, 180, 0);
-    myData.angleShoulder = map(constrain(valShoulder, 407, 3355), 407, 3355, 140, 19);
-    myData.angleElbow = map(constrain(valElbow, 2005, 3649), 2005, 3649, 118, 55);
+    // Map to servo angle range (0-180)
+    // Adjust the input range (0, 4095) based on your potentiometer calibration
+    int currentAngle = map(constrain(rawValue, 0, 4095), 0, 4095, 0, 180);
     
-    // Read Gripper button (active LOW due to INPUT_PULLUP)
-    if (digitalRead(GRIPPER_BUTTON) == LOW) {
-      myData.gripperState = 1; // Button pressed -> Close gripper
-    } else {
-      myData.gripperState = 0; // Button released -> Open gripper
-    }
-    
-    // Send data via ESP-NOW
-    esp_err_t result = esp_now_send(broadcastAddress, (uint8_t *) &myData, sizeof(myData));
-    
-    if (result == ESP_OK) {
-      Serial.print("✓ [");
-      Serial.print(millis());
-      Serial.print("ms] Base: ");
-      Serial.print(myData.angleBase);
-      Serial.print("° | Shoulder: ");
-      Serial.print(myData.angleShoulder);
-      Serial.print("° | Elbow: ");
-      Serial.print(myData.angleElbow);
-      Serial.print("° | Gripper: ");
-      Serial.println(myData.gripperState == 1 ? "CLOSED" : "OPEN");
-    }
-    else {
-      Serial.print("✗ Send Error Code: ");
-      Serial.println(result);
+    // Only send if angle changed by more than threshold
+    if (abs(currentAngle - lastSentAngle) > THRESHOLD) {
+      
+      lastSentAngle = currentAngle;
+      myData.servoAngle = currentAngle;
+      sendCount++;
+      
+      // Send data via ESP-NOW
+      esp_err_t result = esp_now_send(broadcastAddress, (uint8_t *) &myData, sizeof(myData));
+      
+      if (result != ESP_OK) {
+        Serial.print("✗ ERROR CODE: ");
+        Serial.print(result);
+        Serial.print(" | Attempting to send angle: ");
+        Serial.println(currentAngle);
+      }
+      
+      lastSendTime = millis();
     }
   }
 }
